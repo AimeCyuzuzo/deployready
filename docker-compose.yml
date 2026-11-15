@@ -1,0 +1,20 @@
+services:
+  api:
+    build: .
+    image: kora-analytics-api:local
+    # Loads PORT (and any future settings) from .env — copy .env.example to .env first
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: ${PORT:-3000}
+    # Host port 3000 -> the PORT the app listens on inside the container
+    ports:
+      - "3000:${PORT:-3000}"
+    restart: unless-stopped
+    # JSON logs with rotation so they can be reviewed later without filling the disk
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
