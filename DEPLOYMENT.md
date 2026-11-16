@@ -32,24 +32,7 @@ How the Kora Analytics API is deployed, run, monitored and rolled back.
 
 ## 2. Architecture
 
-```
- git push (main)
-      │
-      ▼
- GitHub Actions
-   test ─► build & push image (ghcr.io, tagged with commit SHA) ─► deploy
-                                                                     │
-     OIDC: assume IAM role ─► open SSH (port 22) for the runner IP only
-     SSH as "deploy" ─► pull image, restart container
-     GET /health ─► ok? done : roll back to previous image + fail the run
-     always: remove the temporary SSH rule
-
- Request path
- Browser ─► 54.171.149.85:80 (Elastic IP)
-         ─► Security group: port 80 open to 0.0.0.0/0
-         ─► EC2 instance ─► Docker port mapping 80 → 3000
-         ─► container (Node app running as non-root user "node") ─► GET /health
-```
+See the [architecture diagram in the README](README.md#architecture).
 
 ---
 
