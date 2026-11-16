@@ -1,0 +1,14 @@
+# Copied to the server by the pipeline; IMAGE and PORT come from the server's .env
+services:
+  api:
+    image: ${IMAGE:?IMAGE must be set in .env}
+    environment:
+      PORT: ${PORT:-3000}
+    ports:
+      - "80:${PORT:-3000}"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
