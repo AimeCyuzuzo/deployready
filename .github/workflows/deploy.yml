@@ -1,0 +1,194 @@
+name: Test, build and deploy
+
+on:
+  push:
+    branches: [main]
+
+# One deploy at a time; a newer push waits instead of interrupting a running deploy
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      # Download the repository code onto the runner
+      - uses: actions/checkout@v7
+
+      # Install Node 22 (same version as the Docker image) and cache npm downloads
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      # Install the exact dependency versions from package-lock.json
+      - run: npm ci
+
+      # Run the test suite; if it fails, the pipeline stops and nothing is deployed
+      - run: npm test
+
+  build:
+    name: Build and push image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+    steps:
+      # Download the repository code onto the runner
+      - uses: actions/checkout@v7
+
+      # Build the image name: registry paths must be lowercase, tag = commit SHA
+      - name: Set image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      # Log in to GitHub Container Registry with this run's temporary token
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Set up Docker Buildx so layers can be cached between runs
+      - uses: docker/setup-buildx-action@v4
+
+      # Build the image from the Dockerfile and push it to the registry
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image.outputs.name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to server
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      APP_DIR: /var/www/deployready
+      SERVER_HOST: ${{ vars.SERVER_HOST }}
+      SERVER_USER: ${{ vars.SERVER_USER }}
+      SECURITY_GROUP_ID: ${{ vars.SECURITY_GROUP_ID }}
+    steps:
+      # Download the repository code (needed for the production compose file)
+      - uses: actions/checkout@v7
+
+      # Get short-lived AWS credentials through OIDC; no AWS keys are stored in GitHub
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Temporarily allow SSH from this runner's public IP only
+      - name: Open SSH for this runner
+        id: open_ssh
+        run: |
+          RUNNER_IP=$(curl -fsS https://checkip.amazonaws.com)
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SECURITY_GROUP_ID" \
+            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${RUNNER_IP}/32,Description=github-actions-run-${GITHUB_RUN_ID}}]"
+
+      # Install the deploy key and the server's pinned host key for SSH
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SERVER_KNOWN_HOSTS: ${{ vars.SERVER_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SERVER_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host server
+            HostName ${SERVER_HOST}
+            User ${SERVER_USER}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            ConnectTimeout 10
+            ConnectionAttempts 5
+          EOF
+
+      # Copy the compose file, remember the live image, then pull and start the new one
+      - name: Deploy new image
+        id: deploy
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_PORT: ${{ vars.APP_PORT }}
+        run: |
+          scp deploy/docker-compose.prod.yml server:"$APP_DIR/docker-compose.yml"
+          echo "$GHCR_TOKEN" | ssh server docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          set +e
+          ssh server bash -s -- "$APP_DIR" "$IMAGE" "${APP_PORT:-3000}" <<'EOF'
+          set -euo pipefail
+          cd "$1"
+          grep '^IMAGE=' .env 2>/dev/null | cut -d= -f2- > .previous_image || true
+          printf 'IMAGE=%s\nPORT=%s\n' "$2" "$3" > .env
+          docker compose pull
+          docker compose up -d --remove-orphans
+          EOF
+          STATUS=$?
+          ssh server "docker logout ghcr.io"
+          exit $STATUS
+
+      # Verify the release: /health must return {"status":"ok"} (retries while the container starts)
+      - name: Health check
+        id: health
+        run: |
+          for i in $(seq 1 10); do
+            BODY=$(curl -fsS --max-time 5 "http://${SERVER_HOST}/health" || true)
+            echo "Attempt $i: ${BODY:-no response}"
+            if echo "$BODY" | grep -q '"status":"ok"'; then exit 0; fi
+            sleep 3
+          done
+          echo "::error::Health check failed for $IMAGE"
+          exit 1
+
+      # If the deploy or health check failed, switch back to the previous image (the run still fails)
+      - name: Roll back to previous image
+        if: failure() && (steps.deploy.outcome == 'failure' || steps.health.outcome == 'failure')
+        run: |
+          ssh server bash -s -- "$APP_DIR" "$IMAGE" <<'EOF'
+          set -euo pipefail
+          cd "$1"
+          CURRENT=$(grep '^IMAGE=' .env | cut -d= -f2- || true)
+          PREVIOUS=$(cat .previous_image 2>/dev/null || true)
+          if [ "$CURRENT" != "$2" ]; then
+            echo "The new image was never switched in; nothing to roll back."
+            exit 0
+          fi
+          if [ -z "$PREVIOUS" ]; then
+            echo "::warning::First deploy: there is no previous image to roll back to."
+            exit 0
+          fi
+          sed -i "s|^IMAGE=.*|IMAGE=${PREVIOUS}|" .env
+          docker compose up -d
+          echo "Rolled back to ${PREVIOUS}"
+          EOF
+
+      # Always remove the temporary SSH rule, even if earlier steps failed
+      - name: Close SSH for this runner
+        if: always() && steps.open_ssh.outcome == 'success'
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$SECURITY_GROUP_ID" \
+            --protocol tcp --port 22 --cidr "${RUNNER_IP}/32"
